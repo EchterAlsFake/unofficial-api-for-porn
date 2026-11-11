@@ -28,7 +28,7 @@ porn_api = "porn_api.api:main"
 [tool.uv.build-backend]
 module-name = "porn_api"
 module-root = ""
-source-include = ["USAGE.md"]
+source-include = ["README.md", "LICENSE", "MANIFEST.in"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -37,3 +37,7 @@ testpaths = ["porn_api/tests"]
 
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "B"]
+
+[project.urls]
+Documentation = "https://docs.echteralsfake.me/porn"
+Repository = "https://github.com/EchterAlsFake/unofficial-api-for-porn"
