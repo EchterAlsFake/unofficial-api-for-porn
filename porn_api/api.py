@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from base_api import paginated_stream, PageInfo, validate_pagination, ScrapeStream
+from base_api.modules.pagination import linked_page
+
 import argparse
 import asyncio
 import json
@@ -317,6 +320,7 @@ class Collection(BaseMedia):
         filters: Filters | None = None,
         iterator_config: IteratorConfig | None = None,
     ):
+        validate_pagination(pages, start_page)
         url = filters.apply(self.url) if filters else self.url
         return _listing(
             self.core,
@@ -403,101 +407,76 @@ class Filters:
         )
 
 
-async def _listing(
+def _listing(
     core, url, constructor, extractor, *, pages=1, start_page=1, iterator_config=None
 ):
-    if pages != "all" and (
-        isinstance(pages, bool) or not isinstance(pages, int) or pages < 1
-    ):
-        raise ValueError("pages must be a positive integer or 'all'")
-    if (
-        isinstance(start_page, bool)
-        or not isinstance(start_page, int)
-        or start_page < 1
-    ):
-        raise ValueError("start_page must be a positive integer")
-    current = update_url_query(
-        normalize_url(url), pg=start_page if start_page > 1 else None
-    )
-    config = iterator_config or make_iterator_config(
-        load_specific_sources=(),
-        page_error_mode=ErrorMode.RAISE,
-        item_error_mode=ErrorMode.RAISE,
-    )
-    visited = set()
-    signatures = set()
-    index = 0
-    boundary_probe = False
-    while current and (pages == "all" or index < pages):
-        if current in visited:
-            raise errors.ParseError("Pagination repeated a page URL")
-        visited.add(current)
-        # Helper performs the fetch and applies the caller's retry/error settings.
-        # Capture that same response during extraction to follow observed links.
-        response = {}
+    validate_pagination(pages, start_page)
+    url = normalize_url(url)
+    if urlsplit(url).path.rstrip("/").endswith("/search"):
 
-        def extract(content, response=response, current=current):
-            response["content"] = content
-            actual = getattr(content, "url", None) or current
-            normalize_url(actual)
-            if urlsplit(actual).path.rstrip("/") != urlsplit(current).path.rstrip(
-                "/"
-            ) and not urlsplit(current).path.rstrip("/").endswith("/search"):
-                raise errors.ParseError("Listing redirected to a different resource")
-            entries = extractor(content, actual)
-            fingerprint = tuple(entry["url"] for entry in entries)
-            if fingerprint and fingerprint in signatures:
-                raise errors.ParseError("Pagination repeated the previous listing")
-            response["signature"] = fingerprint
-            return entries
-
-        stream = scrape_stream(
-            core=core,
-            constructor=constructor,
-            target_page_urls=[current],
-            item_extractor=extract,
-            iterator_config=config,
-        )
-        try:
-            async with aclosing(stream):
+        async def resolve_search():
+            content = await get_html_content(core, url)
+            actual = getattr(content, "url", None) or url
+            if urlsplit(actual).path.rstrip("/").endswith("/search"):
+                raise errors.ParseError("Search did not resolve to its listing route")
+            stream = _listing(
+                core,
+                actual,
+                constructor,
+                extractor,
+                pages=pages,
+                start_page=start_page,
+                iterator_config=iterator_config,
+            )
+            async with stream:
                 async for result in stream:
-                    if boundary_probe and result.error and _is_404(result.error):
-                        return
-                    yield replace(result, page_index=index)
-        except PageFetchError as error:
-            if boundary_probe and _is_404(error):
-                return
-            raise
-        if "signature" not in response:
-            return  # A yielded/skipped terminal page error ends unknown pagination.
-        signatures.add(response["signature"])
-        following = next_page(
-            response["content"], getattr(response["content"], "url", None) or current
-        )
+                    yield result
+
+        return ScrapeStream(resolve_search())
+
+    def page_url(page):
+        return update_url_query(url, pg=page if page > 1 else None)
+
+    def info(content, page, rows):
+        actual = getattr(content, "url", None) or page_url(page)
+        normalize_url(actual)
+        if urlsplit(actual).path.rstrip("/") != urlsplit(url).path.rstrip(
+            "/"
+        ) and not urlsplit(url).path.rstrip("/").endswith("/search"):
+            raise errors.ParseError("Listing redirected to a different resource")
+        following = next_page(content, actual)
         if following:
-            expected = start_page + index + 1
-            if int(parse_qs(urlsplit(following).query).get("pg", [1])[0]) != expected:
+            if int(parse_qs(urlsplit(following).query).get("pg", [1])[0]) != page + 1:
                 raise errors.ParseError("Unexpected next page number")
-            if urlsplit(following).hostname != urlsplit(current).hostname:
-                # Bare porn.com legitimately redirects to www.porn.com.
-                resolved_host = urlsplit(
-                    getattr(response["content"], "url", None) or current
-                ).hostname
-                if urlsplit(following).hostname != resolved_host:
-                    raise errors.ParseError("Pagination changed locale/host")
-        boundary_probe = False
-        if (
-            not following
-            and response["signature"]
-            and (pages == "all" or index + 1 < pages)
-        ):
-            # Live pages can outlast the site's inaccurate last-page navigation.
-            # Probe the observed pg mechanism until a real empty page or 404.
-            actual = getattr(response["content"], "url", None) or current
-            following = update_url_query(actual, pg=start_page + index + 1)
-            boundary_probe = True
-        current = following
-        index += 1
+            if urlsplit(following).hostname != urlsplit(actual).hostname:
+                raise errors.ParseError("Pagination changed locale/host")
+        # No next anchor is insufficient on this site; probe the established
+        # numbered route until its real empty page/404 boundary.
+        return PageInfo(
+            terminal=not rows,
+            next_url=following or update_url_query(actual, pg=page + 1),
+            next_is_probe=following is None,
+        )
+
+    return paginated_stream(
+        core=core,
+        constructor=constructor,
+        page_url=page_url,
+        item_extractor=lambda content: extractor(
+            content, getattr(content, "url", None) or url
+        ),
+        page_info=info,
+        pages=pages,
+        start_page=start_page,
+        iterator_config=iterator_config
+        or make_iterator_config(
+            load_specific_sources=(),
+            page_error_mode=ErrorMode.RAISE,
+            item_error_mode=ErrorMode.RAISE,
+        ),
+        terminal_error=lambda error, page: page > 1 and _is_404(error),
+        verify_first=True,
+    )
 
 
 def _is_404(error: BaseException) -> bool:
@@ -572,6 +551,7 @@ class Client:
         filters: Filters | None = None,
         iterator_config: IteratorConfig | None = None,
     ):
+        validate_pagination(pages, start_page)
         if not query.strip() or len(query) > 100:
             raise ValueError("Search query must contain 1–100 characters")
         url = update_url_query(f"{self.content_url}/search", sq=query.strip())
@@ -588,6 +568,7 @@ class Client:
         )
 
     def pornstars(self, *, pages=1, start_page=1, iterator_config=None):
+        validate_pagination(pages, start_page)
         return _listing(
             self.core,
             f"{self.content_url}/pornstars",
@@ -599,6 +580,7 @@ class Client:
         )
 
     def channels(self, *, pages=1, start_page=1, iterator_config=None):
+        validate_pagination(pages, start_page)
         return _listing(
             self.core,
             f"{self.content_url}/sites",
